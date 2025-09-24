@@ -1,0 +1,274 @@
+#!/bin/bash
+
+# Define protected system directories
+PROTECTED_DIRS=(
+    "/"
+    "/boot"
+    "/etc"
+    "/usr"
+    "/var"
+    "/bin"
+    "/sbin"
+    "/lib"
+    "/lib64"
+)
+
+# Function to display help message
+show_help() {
+    cat << EOF
+Usage: podwrap [podman run command args]
+
+Version: 0.1
+Dependencies:
+- jq
+- root priveleges (does not support rootless podman)
+
+This script wraps the podman run command with additional functionality:
+- Injects userns=auto option to enable user namespacing (security hardening)
+- Checks if mount points exist and offers to create them
+- Automatically changes permissions of mounted host directories for userns=auto compatibility
+- Saves the last executed arg list to last_args.log
+- Allows the last arg list to be reloaded and run from last_args.log
+- Logs all executed commands to past_runs.log
+- Passes through the exit code from podman
+
+Example:
+    ./podwrap -p 80:80 -v /path/to/mount:/container/path myimage:tag
+
+Options:
+    --last  Load the last used podman run command from last_args.log
+    -h, --help  Display this help message
+
+The script must be called with a complete set of podman run command arguments.
+EOF
+    exit 0
+}
+
+# Function to check if path is protected
+is_protected_path() {
+    local check_path="$1"
+    for protected in "${PROTECTED_DIRS[@]}"; do
+        if [[ "$check_path" == "$protected" || "$check_path" == "$protected/"* ]]; then
+            return 0  # True - path is protected
+        fi
+    done
+    return 1  # False - path is safe
+}
+
+# Show help if -h or --help is passed
+if [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
+    show_help
+fi
+
+#Check if jq binary is available on system
+if which jq >/dev/null 2>&1; then
+  echo "Confirmed that jq binary is installed."
+else
+  echo "ERROR: jq binary is not installed. Install jq onto system."
+  exit 1
+fi
+
+# Check if command args were provided
+if [ $# -eq 0 ]; then
+    echo "Error: Please provide a complete set of podman run command args"
+    exit 1
+fi
+
+# Confirm that the script is run as root
+if [ "$EUID" -ne 0 ]; then
+    echo "Error: This script must be run as root to manage container permissions"
+    exit 1
+fi
+
+# Log file location
+LOG_FILE="./past_runs.log"
+ARGS_LOG="./last_args.log"
+
+# Check for loading of last args from file
+if [[ "$1" == "--last" ]]; then
+    if [ -f "$ARGS_LOG" ]; then
+        echo "Loading last args from file..."
+        source "$ARGS_LOG"
+        set -- "${LAST_ARGS[@]}"
+    else
+        echo "Error: No previous args found in $ARGS_LOG"
+        exit 1
+    fi
+fi
+
+# Check for userns option variations
+echo "Checking userns option..."
+if echo "$*" | grep -qE -- '--userns(=| +)auto\b'; then
+    # Case 1: --userns=auto is present, use as-is
+    MODIFIED_ARGS="$*"
+elif echo "$*" | grep -qE -- '--userns(=| +)[^a][^u][^t][^o]\b|--userns\b'; then
+    # Case 2: --userns is present but not set to auto
+    echo "Error: This script requires --userns=auto for security. Other userns values are not supported."
+    exit 1
+else
+    # Case 3: No userns option present, inject --userns=auto
+    MODIFIED_ARGS="--userns=auto $*"
+fi
+
+# Extract the container image (last argument)
+CONTAINER_IMAGE=$(echo "$MODIFIED_ARGS" | awk '{print $NF}')
+
+# Simpler image format validation
+if [[ ! "$CONTAINER_IMAGE" =~ ^([a-zA-Z0-9.-:]+\/)*[a-zA-Z0-9.-]+:[a-zA-Z0-9.-]+$ ]]; then
+    echo "Error: Invalid container image format: $CONTAINER_IMAGE"
+    echo "Expected format: [registry/][user/]name:tag"
+    exit 1
+fi
+
+# Reconstruct the full command from arguments
+FULL_COMMAND="podman create $MODIFIED_ARGS"
+
+# Log the command with timestamp
+echo "" >> "$LOG_FILE"
+echo "$(date '+%Y-%m-%d %H:%M:%S') - $FULL_COMMAND" >> "$LOG_FILE"
+echo "Using container image: $CONTAINER_IMAGE" >> "$LOG_FILE"
+
+# Use a temporary container to extract important UID/GID info
+TEMP_COMMAND="podman run -d --name=temp $CONTAINER_IMAGE sleep infinity"
+echo "Running temporary container..."
+TEMP_OUTPUT=$(eval "$TEMP_COMMAND" 2>&1)
+TEMP_EXIT_CODE=$?
+
+if [ $TEMP_EXIT_CODE -eq 0 ]; then
+    echo "Temporary container successfully created..."
+    TEMP_NAME=$TEMP_OUTPUT
+    # Extract container user info
+    CONTAINER_USER=$(podman inspect "$TEMP_NAME" | jq -r '.[0].Config.User // empty')
+    if [ -z "$CONTAINER_USER" ]; then
+        CONTAINER_USER="root"
+    fi
+    CUID=$(podman exec $TEMP_NAME id -u $CONTAINER_USER)
+    CGID=$(podman exec $TEMP_NAME id -g $CONTAINER_USER)
+    echo "Got container user: $CONTAINER_USER" >> "$LOG_FILE"
+    echo "Got container UID: $CUID" >> "$LOG_FILE"
+    echo "Got container GID: $CGID" >> "$LOG_FILE"
+    echo "Stopping and removing temporary container..."
+    podman stop $TEMP_NAME
+    podman rm $TEMP_NAME
+else
+    echo "Error: Failed to run temporary container"
+    echo "Temporary container failed to run with exit code $TEMP_EXIT_CODE" >> "$LOG_FILE"
+    echo "Error output: $TEMP_OUTPUT" >> "$LOG_FILE"
+    exit $TEMP_EXIT_CODE
+fi
+
+# Extract mount points using grep and cut
+# Store them in an array
+MOUNT_POINTS=($(echo "$FULL_COMMAND" | grep -o -P '(?<=-v )[^:]+'))
+
+# Validate all mount points from the host
+echo "Checking mount points..."
+for mount in "${MOUNT_POINTS[@]}"; do
+    # Check if mount point is an absolute path
+    if [[ "$mount" != /* ]]; then
+        echo "Error: Mount point $mount must be an absolute path"
+        exit 1
+    fi
+    
+    # Check if mount point is protected
+    if is_protected_path "$mount"; then
+        echo "Error: Cannot mount protected system directory: $mount"
+        exit 1
+    fi
+    
+    # Check if mount point exists
+    if [ ! -d "$mount" ]; then
+        echo "Warning: Mount point $mount does not exist"
+        read -p "Create directory? (y/n): " response
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            mkdir -p "$mount"
+        fi
+    fi
+done
+
+# Execute the podman command and capture output
+echo "Creating container with podman..."
+CONTAINER_OUTPUT=$(eval "$FULL_COMMAND" 2>&1)
+EXIT_CODE=$?
+
+# Save container ID/name if command was successful
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "Container successfully created..."
+    # Save container ID/name
+    CONTAINER_NAME=$CONTAINER_OUTPUT
+    echo "Container successfully created: $CONTAINER_NAME" >> "$LOG_FILE"
+    
+    # Extract the UID/GID mappings from the container
+    echo "Changing ownership of mounted host directories..."
+
+    # Add proper quoting and error handling
+    UID_MAP=$(podman inspect "$CONTAINER_NAME" | jq -r '.[0].HostConfig.IDMappings.UidMap[0]' 2>/dev/null)
+    if [ $? -ne 0 ]; then
+        echo "Error: Failed to extract UID mapping from container"
+        exit 1
+    fi
+
+    GID_MAP=$(podman inspect "$CONTAINER_NAME" | jq -r '.[0].HostConfig.IDMappings.GidMap[0]' 2>/dev/null)
+    if [ $? -ne 0 ]; then
+        echo "Error: Failed to extract GID mapping from container"
+        exit 1
+    fi
+
+    # Process the mappings
+    HUID_START=$(echo "$UID_MAP" | awk -F: '{print $2}')
+    HGID_START=$(echo "$GID_MAP" | awk -F: '{print $2}')
+    HUID=$((HUID_START + CUID))
+    HGID=$((HGID_START + CGID))
+
+    # Change ownership of mounted host folders
+    for mount in "${MOUNT_POINTS[@]}"; do
+        chown -R $HUID:$HGID $mount
+    done
+
+    # Start the container
+    echo "Starting container..."
+    podman start $CONTAINER_NAME
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -eq 0 ]; then
+        echo "Container started successfully..."
+        echo "Container started successfully!" >> "$LOG_FILE"
+    else
+        echo "Container failed to start..."
+        echo "Start command failed with exit code $EXIT_CODE" >> "$LOG_FILE"
+        echo "Error output: $CONTAINER_OUTPUT" >> "$LOG_FILE"
+        exit $EXIT_CODE
+    fi
+
+    # Save the last used arguments to a file with proper quoting
+    echo "Saving last args to file..."
+    declare -a QUOTED_ARGS
+    for arg in "$@"; do
+        if [[ "$arg" == -e* && "$arg" =~ =\[.*\]$ ]]; then
+            # Handle any environment variable containing a JSON array
+            # Extract variable name and value
+            var_name=${arg#-e }        # Remove -e prefix
+            var_name=${var_name%%=*}   # Get everything before =
+            value=${arg#*=}           # Get everything after =
+
+            # Preserve the exact string with quotes to maintain TOML format
+            QUOTED_ARGS+=("-e ${var_name}='${value}'")
+        elif [[ "$arg" == -e* ]]; then
+            # Handle regular environment variables
+            QUOTED_ARGS+=("${arg}")
+        else
+            # Handle non-environment variable arguments
+            QUOTED_ARGS+=("$arg")
+        fi
+    done
+
+    # Save with proper escaping
+    printf "LAST_ARGS=(\n" > "$ARGS_LOG"
+    printf "    %s\n" "${QUOTED_ARGS[@]}" >> "$ARGS_LOG"
+    printf ")\n" >> "$ARGS_LOG"
+
+else
+    echo "Container failed to create..."
+    echo "Create command failed with exit code $EXIT_CODE" >> "$LOG_FILE"
+    echo "Error output: $CONTAINER_OUTPUT" >> "$LOG_FILE"
+    exit $EXIT_CODE
+fi
