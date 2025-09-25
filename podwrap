@@ -140,10 +140,21 @@ if [ $TEMP_EXIT_CODE -eq 0 ]; then
     # Extract container user info
     CONTAINER_USER=$(podman inspect "$TEMP_NAME" | jq -r '.[0].Config.User // empty')
     if [ -z "$CONTAINER_USER" ]; then
+        echo "No user specified in container, defaulting to root"
         CONTAINER_USER="root"
+        CUID=0
+        CGID=0
+    else
+         # Try to get UID/GID, handle errors
+        CUID=$(podman exec $TEMP_NAME id -u $CONTAINER_USER 2>/dev/null || echo "65534")
+        CGID=$(podman exec $TEMP_NAME id -g $CONTAINER_USER 2>/dev/null || echo "65534")
+        # Check if we got nouser/nogroup (65534)
+        if [ "$CUID" = "65534" ] || [ "$CGID" = "65534" ]; then
+            echo "Warning: Container user maps to nouser/nogroup, using root (0:0) instead"
+            CUID=0
+            CGID=0
+        fi
     fi
-    CUID=$(podman exec $TEMP_NAME id -u $CONTAINER_USER)
-    CGID=$(podman exec $TEMP_NAME id -g $CONTAINER_USER)
     echo "Got container user: $CONTAINER_USER" >> "$LOG_FILE"
     echo "Got container UID: $CUID" >> "$LOG_FILE"
     echo "Got container GID: $CGID" >> "$LOG_FILE"
@@ -176,12 +187,25 @@ for mount in "${MOUNT_POINTS[@]}"; do
         exit 1
     fi
     
+    # Get the parent directory of the mount point
+    mount_parent="$(dirname "$mount")"
+
     # Check if mount point exists
-    if [ ! -d "$mount" ]; then
+    if [ ! -e "$mount" ]; then
         echo "Warning: Mount point $mount does not exist"
         read -p "Create directory? (y/n): " response
         if [[ "$response" =~ ^[Yy]$ ]]; then
-            mkdir -p "$mount"
+            # Check if parent directory exists
+            if [ ! -d "$mount_parent" ]; then
+                mkdir -p "$mount_parent"
+            fi
+            # Check if the original path ended with a / (indicating directory intent)
+            if [[ "$mount" == */ ]]; then
+                mkdir -p "$mount"
+            else
+                # Create as empty file if no trailing slash
+                touch "$mount"
+            fi
         fi
     fi
 done
@@ -214,15 +238,36 @@ if [ $EXIT_CODE -eq 0 ]; then
         exit 1
     fi
 
-    # Process the mappings
+    # Process the mappings with safety checks
     HUID_START=$(echo "$UID_MAP" | awk -F: '{print $2}')
     HGID_START=$(echo "$GID_MAP" | awk -F: '{print $2}')
+    UID_SIZE=$(echo "$UID_MAP" | awk -F: '{print $3}')
+    GID_SIZE=$(echo "$GID_MAP" | awk -F: '{print $3}')
+
+    #Calculate the host UID/GID to use
     HUID=$((HUID_START + CUID))
     HGID=$((HGID_START + CGID))
 
+    # Verify the calculated IDs are within the mapped range
+    if [ $HUID -ge $((HUID_START + UID_SIZE)) ] || [ $HGID -ge $((HGID_START + GID_SIZE)) ]; then
+        echo "Error: Calculated UID/GID outside of available range in user namespace"
+        echo "Container UID/GID ($CUID:$CGID) too large for namespace mapping"
+        echo "Available range: $HUID_START to $((HUID_START + UID_SIZE - 1))"
+        podman rm $CONTAINER_NAME
+        exit 1
+    fi
+
     # Change ownership of mounted host folders
     for mount in "${MOUNT_POINTS[@]}"; do
-        chown -R $HUID:$HGID $mount
+        if [ -e "$mount" ]; then
+            # Use -h to handle symlinks properly
+            chown -h $HUID:$HGID "$mount"
+        
+            # If it's a directory, handle contents recursively
+            if [ -d "$mount" ]; then
+                chown -R $HUID:$HGID "$mount"
+            fi
+        fi
     done
 
     # Start the container
